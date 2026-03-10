@@ -1,22 +1,33 @@
 {
   "seed": 6,
+  "logo_svg": "assets/TokenTek.svg",
   "output_file": "output/tiled_background.png",
   "image_width": 2400,
   "image_height": 1600,
   "scalar": 48,
-  "background_color": "#C8C0B2",
-  "stroke_color": "#2F3332",
+  "background_color": "#56544A",
+  "stroke_color": "#2A2925",
   "stroke_width": 2,
+  "outline_color": "#000000",
+  "outline_width": 2,
+  "accent_color": "#FF5710",
+  "accent_count": 4,
   "palette": [
-    "#2F3332",
-    "#8F8A7D",
-    "#C8C0B2"
+    "#8F8A7D"
   ],
   "tile_colors": {
-    "H1": "#2F3332",
+    "H1": "#8F8A7D",
     "H": "#8F8A7D",
-    "T": "#C8C0B2",
+    "T": "#8F8A7D",
     "P": "#8F8A7D",
-    "F": "#C8C0B2"
+    "F": "#8F8A7D"
+  },
+  "unique_tile_colors": {
+    "base_hue": 0,
+    "hue_range": 0,
+    "saturation_min": 0,
+    "saturation_max": 0,
+    "lightness_min": 28,
+    "lightness_max": 65
   }
 }

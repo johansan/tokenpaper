@@ -1,17 +1,192 @@
 #!/usr/bin/env python3
 
 import argparse
+import colorsys
+import hashlib
 import json
 import math
+import re
 import struct
 import zlib
 from itertools import cycle
 from pathlib import Path
 
 import pattern_generator
-from geometry import Vector
+from geometry import Vector, hat_outline
 
 TILE_LABELS = ("H1", "H", "T", "P", "F")
+
+SQRT3 = 1.7320508075688772
+
+# Hat outline bounds (precomputed)
+HAT_MIN_X = min(v.x for v in hat_outline)
+HAT_MAX_X = max(v.x for v in hat_outline)
+HAT_MIN_Y = min(v.y for v in hat_outline)
+HAT_MAX_Y = max(v.y for v in hat_outline)
+HAT_WIDTH = HAT_MAX_X - HAT_MIN_X
+HAT_HEIGHT = HAT_MAX_Y - HAT_MIN_Y
+
+
+# --- SVG path parsing ---
+
+def _tokenize_path(d):
+    return re.findall(r'[A-Za-z]|[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?', d)
+
+
+def _cubic_bezier(p0, p1, p2, p3, n=10):
+    points = []
+    for i in range(1, n + 1):
+        t = i / n
+        mt = 1 - t
+        x = mt**3*p0[0] + 3*mt**2*t*p1[0] + 3*mt*t**2*p2[0] + t**3*p3[0]
+        y = mt**3*p0[1] + 3*mt**2*t*p1[1] + 3*mt*t**2*p2[1] + t**3*p3[1]
+        points.append((x, y))
+    return points
+
+
+def _parse_path_to_polygons(d):
+    tokens = _tokenize_path(d)
+    polygons = []
+    current = []
+    cx, cy = 0.0, 0.0
+    sx, sy = 0.0, 0.0
+    i = 0
+
+    while i < len(tokens):
+        cmd = tokens[i]
+        if not cmd.isalpha():
+            i += 1
+            continue
+        i += 1
+
+        def num():
+            nonlocal i
+            v = float(tokens[i])
+            i += 1
+            return v
+
+        if cmd == 'M':
+            if current:
+                polygons.append(current)
+            cx, cy = num(), num()
+            sx, sy = cx, cy
+            current = [(cx, cy)]
+            while i < len(tokens) and not tokens[i].isalpha():
+                cx, cy = num(), num()
+                current.append((cx, cy))
+        elif cmd == 'm':
+            if current:
+                polygons.append(current)
+            cx += num(); cy += num()
+            sx, sy = cx, cy
+            current = [(cx, cy)]
+            while i < len(tokens) and not tokens[i].isalpha():
+                cx += num(); cy += num()
+                current.append((cx, cy))
+        elif cmd == 'L':
+            while i < len(tokens) and not tokens[i].isalpha():
+                cx, cy = num(), num()
+                current.append((cx, cy))
+        elif cmd == 'l':
+            while i < len(tokens) and not tokens[i].isalpha():
+                cx += num(); cy += num()
+                current.append((cx, cy))
+        elif cmd == 'H':
+            while i < len(tokens) and not tokens[i].isalpha():
+                cx = num()
+                current.append((cx, cy))
+        elif cmd == 'h':
+            while i < len(tokens) and not tokens[i].isalpha():
+                cx += num()
+                current.append((cx, cy))
+        elif cmd == 'V':
+            while i < len(tokens) and not tokens[i].isalpha():
+                cy = num()
+                current.append((cx, cy))
+        elif cmd == 'v':
+            while i < len(tokens) and not tokens[i].isalpha():
+                cy += num()
+                current.append((cx, cy))
+        elif cmd == 'C':
+            while i < len(tokens) and not tokens[i].isalpha():
+                x1, y1 = num(), num()
+                x2, y2 = num(), num()
+                x3, y3 = num(), num()
+                current.extend(_cubic_bezier((cx, cy), (x1, y1), (x2, y2), (x3, y3)))
+                cx, cy = x3, y3
+        elif cmd == 'c':
+            while i < len(tokens) and not tokens[i].isalpha():
+                dx1, dy1 = num(), num()
+                dx2, dy2 = num(), num()
+                dx3, dy3 = num(), num()
+                current.extend(_cubic_bezier(
+                    (cx, cy), (cx+dx1, cy+dy1), (cx+dx2, cy+dy2), (cx+dx3, cy+dy3)))
+                cx, cy = cx + dx3, cy + dy3
+        elif cmd in ('Z', 'z'):
+            cx, cy = sx, sy
+            if current:
+                polygons.append(current)
+                current = []
+
+    if current:
+        polygons.append(current)
+    return polygons
+
+
+def load_logo_polygons(svg_path):
+    """Parse SVG and convert paths to hat_outline coordinate space (mirrored horizontally)."""
+    svg_text = Path(svg_path).read_text()
+    path_data = re.findall(r'<path[^>]*\bd="([^"]+)"', svg_text)
+
+    all_svg_polys = []
+    for d in path_data:
+        all_svg_polys.extend(_parse_path_to_polygons(d))
+
+    all_pts = [pt for poly in all_svg_polys for pt in poly]
+    svg_min_x = min(p[0] for p in all_pts)
+    svg_max_x = max(p[0] for p in all_pts)
+    svg_min_y = min(p[1] for p in all_pts)
+    svg_max_y = max(p[1] for p in all_pts)
+    svg_w = svg_max_x - svg_min_x
+    svg_h = svg_max_y - svg_min_y
+    scale = ((svg_w / HAT_WIDTH) + (svg_h / HAT_HEIGHT)) / 2
+
+    hat_polys = []
+    for poly in all_svg_polys:
+        hat_polys.append([
+            (HAT_MAX_X - (x - svg_min_x) / scale,
+             (y - svg_min_y) / scale + HAT_MIN_Y)
+            for x, y in poly
+        ])
+    return hat_polys
+
+
+def recover_affine(tile_vertices):
+    """Recover the affine transform from hat_outline space to tile vertex space."""
+    # hat_outline[0] = (0, 0), hat_outline[7] = (4, 0), hat_outline[9] = (3, sqrt3)
+    c = tile_vertices[0].x
+    f = tile_vertices[0].y
+    a = (tile_vertices[7].x - c) / 4.0
+    d = (tile_vertices[7].y - f) / 4.0
+    b = (tile_vertices[9].x - a * 3.0 - c) / SQRT3
+    e = (tile_vertices[9].y - d * 3.0 - f) / SQRT3
+    return (a, b, c, d, e, f)
+
+
+def generate_unique_tile_color(tile_index, base_hue, hue_range, sat_range, lit_range):
+    """Generate a deterministic pseudo-random pastel color for a tile index."""
+    # Hash the index for a stable pseudo-random value
+    h = hashlib.md5(tile_index.to_bytes(4, 'little')).digest()
+    r1 = h[0] / 255.0
+    r2 = h[1] / 255.0
+    r3 = h[2] / 255.0
+
+    hue = (base_hue + (r1 - 0.5) * hue_range) % 1.0
+    sat = sat_range[0] + r2 * (sat_range[1] - sat_range[0])
+    lit = lit_range[0] + r3 * (lit_range[1] - lit_range[0])
+
+    r, g, b = colorsys.hls_to_rgb(hue, lit, sat)
+    return (int(r * 255), int(g * 255), int(b * 255))
 
 
 def parse_args():
@@ -198,7 +373,7 @@ def fill_polygon(image, mask, width, height, points, color):
                 set_pixel(image, mask, width, height, x, y, color)
 
 
-def draw_tile(tile, image, mask, width, height, offset_coord, scalar, stroke_color, stroke_width):
+def draw_tile(tile, image, mask, width, height, offset_coord, scalar, stroke_color, stroke_width, logo_polygons=None, channel_color_override=None):
     fill_color = tile[1][1]
     points = []
 
@@ -207,7 +382,26 @@ def draw_tile(tile, image, mask, width, height, offset_coord, scalar, stroke_col
         y = vertex.y * scalar + height + offset_coord.y * height
         points.append((x, y))
 
-    fill_polygon(image, mask, width, height, points, fill_color)
+    if logo_polygons:
+        # Fill entire tile with channel color, then overlay logo pieces
+        ch_color = channel_color_override if channel_color_override else stroke_color
+        fill_polygon(image, mask, width, height, points, ch_color)
+
+        # Recover affine transform from hat_outline to this tile's vertices
+        mat = recover_affine(tile[0])
+
+        for logo_poly in logo_polygons:
+            screen_pts = []
+            for hx, hy in logo_poly:
+                tx = mat[0] * hx + mat[1] * hy + mat[2]
+                ty = mat[3] * hx + mat[4] * hy + mat[5]
+                sx = tx * scalar - offset_coord.x * width
+                sy = ty * scalar + height + offset_coord.y * height
+                screen_pts.append((sx, sy))
+            if len(screen_pts) >= 3:
+                fill_polygon(image, mask, width, height, screen_pts, fill_color)
+    else:
+        fill_polygon(image, mask, width, height, points, fill_color)
 
     for index in range(len(points)):
         draw_line(
@@ -260,6 +454,28 @@ def render_image(config):
     stroke_width = int(config.get("stroke_width", 2))
     empty_pixel_tolerance = int(config.get("empty_pixel_tolerance", 3))
 
+    # Load logo SVG
+    svg_path = config.get("logo_svg", None)
+    logo_polygons = None
+    if svg_path:
+        logo_polygons = load_logo_polygons(svg_path)
+
+    # Unique per-tile color settings (HSL-based)
+    unique_colors_cfg = config.get("unique_tile_colors", None)
+    base_hue = None
+    if unique_colors_cfg:
+        # base_hue in config is 0-360 degrees, convert to 0-1
+        base_hue = unique_colors_cfg.get("base_hue", 80) / 360.0
+        hue_range = unique_colors_cfg.get("hue_range", 30) / 360.0
+        sat_range = (
+            unique_colors_cfg.get("saturation_min", 8) / 100.0,
+            unique_colors_cfg.get("saturation_max", 20) / 100.0,
+        )
+        lit_range = (
+            unique_colors_cfg.get("lightness_min", 40) / 100.0,
+            unique_colors_cfg.get("lightness_max", 62) / 100.0,
+        )
+
     pattern_generator.colors = build_tile_colors(config)
 
     reset_generator()
@@ -270,7 +486,44 @@ def render_image(config):
         output_image = create_background_image(width, height, background_color)
         coverage_mask = create_coverage_mask(width, height)
 
-        for tile in pattern_generator.vertices_to_draw:
+        # Accent color setup
+        accent_color_cfg = config.get("accent_color", None)
+        accent_count = int(config.get("accent_count", 0))
+        accent_color = hex_to_bgr(accent_color_cfg) if accent_color_cfg else None
+
+        # Find visible tiles first, then pick accents from those
+        accent_indices = set()
+        if accent_color and accent_count > 0:
+            visible = []
+            for ti, tile in enumerate(pattern_generator.vertices_to_draw):
+                # Check if tile centroid is within viewport
+                cx = sum(v.x for v in tile[0]) / len(tile[0])
+                cy = sum(v.y for v in tile[0]) / len(tile[0])
+                sx = cx * scalar - offset_coordinate.x * width
+                sy = cy * scalar + height + offset_coordinate.y * height
+                if 0 <= sx < width and 0 <= sy < height:
+                    visible.append(ti)
+            if visible:
+                for k in range(accent_count):
+                    h = hashlib.md5((seed * 1000 + k).to_bytes(8, 'little')).digest()
+                    idx = (h[0] | h[1] << 8) % len(visible)
+                    accent_indices.add(visible[idx])
+
+        outline_color = config.get("outline_color", None)
+        outline_rgb = hex_to_bgr(outline_color) if outline_color else None
+        outline_width = int(config.get("outline_width", stroke_width))
+
+        for tile_index, tile in enumerate(pattern_generator.vertices_to_draw):
+            channel_override = None
+            if tile_index in accent_indices:
+                tile = [tile[0], [tile[1][0], accent_color]]
+                # Darker variant of accent color for the logo channels
+                channel_override = tuple(max(0, c // 2) for c in accent_color)
+            elif base_hue is not None:
+                tile_color = generate_unique_tile_color(
+                    tile_index, base_hue, hue_range, sat_range, lit_range)
+                tile = [tile[0], [tile[1][0], tile_color]]
+
             draw_tile(
                 tile,
                 output_image,
@@ -281,7 +534,23 @@ def render_image(config):
                 scalar,
                 stroke_color,
                 stroke_width,
+                logo_polygons,
+                channel_override,
             )
+
+            # Draw hat outline on top
+            if outline_rgb:
+                points = []
+                for vertex in tile[0]:
+                    x = vertex.x * scalar - offset_coordinate.x * width
+                    y = vertex.y * scalar + height + offset_coordinate.y * height
+                    points.append((x, y))
+                for idx in range(len(points)):
+                    draw_line(
+                        output_image, coverage_mask, width, height,
+                        points[idx], points[(idx + 1) % len(points)],
+                        outline_rgb, outline_width,
+                    )
 
         empty_pixels = coverage_mask.count(0)
         if empty_pixels <= empty_pixel_tolerance:
