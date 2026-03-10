@@ -1,0 +1,22 @@
+{
+  "seed": 6,
+  "output_file": "output/tiled_background.png",
+  "image_width": 2400,
+  "image_height": 1600,
+  "scalar": 48,
+  "background_color": "#C8C0B2",
+  "stroke_color": "#2F3332",
+  "stroke_width": 2,
+  "palette": [
+    "#2F3332",
+    "#8F8A7D",
+    "#C8C0B2"
+  ],
+  "tile_colors": {
+    "H1": "#2F3332",
+    "H": "#8F8A7D",
+    "T": "#C8C0B2",
+    "P": "#8F8A7D",
+    "F": "#C8C0B2"
+  }
+}
