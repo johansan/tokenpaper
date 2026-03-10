@@ -173,10 +173,10 @@ def recover_affine(tile_vertices):
     return (a, b, c, d, e, f)
 
 
-def generate_unique_tile_color(tile_index, base_hue, hue_range, sat_range, lit_range):
+def generate_unique_tile_color(tile_index, base_hue, hue_range, sat_range, lit_range, salt=0):
     """Generate a deterministic pseudo-random pastel color for a tile index."""
-    # Hash the index for a stable pseudo-random value
-    h = hashlib.md5(tile_index.to_bytes(4, 'little')).digest()
+    # Hash the tile index with an optional salt so we can try alternate colors.
+    h = hashlib.md5(f"{tile_index}:{salt}".encode("utf-8")).digest()
     r1 = h[0] / 255.0
     r2 = h[1] / 255.0
     r3 = h[2] / 255.0
@@ -233,6 +233,142 @@ def build_tile_colors(config):
         resolved[label] = [color, hex_to_bgr(color)]
 
     return resolved
+
+
+def build_tile_adjacency(tiles, precision=6):
+    adjacency = [set() for _ in tiles]
+    edge_to_tiles = {}
+
+    def point_key(vertex):
+        return (round(vertex.x, precision), round(vertex.y, precision))
+
+    for tile_index, tile in enumerate(tiles):
+        vertices = tile[0]
+        for vertex_index in range(len(vertices)):
+            start = point_key(vertices[vertex_index])
+            end = point_key(vertices[(vertex_index + 1) % len(vertices)])
+            edge = (start, end) if start <= end else (end, start)
+            edge_to_tiles.setdefault(edge, []).append(tile_index)
+
+    for tile_indices in edge_to_tiles.values():
+        if len(tile_indices) < 2:
+            continue
+        for left_index in range(len(tile_indices)):
+            for right_index in range(left_index + 1, len(tile_indices)):
+                a = tile_indices[left_index]
+                b = tile_indices[right_index]
+                adjacency[a].add(b)
+                adjacency[b].add(a)
+
+    return adjacency
+
+
+def dedupe_colors(colors):
+    unique = []
+    seen = set()
+
+    for color in colors:
+        if color in seen:
+            continue
+        seen.add(color)
+        unique.append(color)
+
+    return unique
+
+
+def derive_color_variant(base_color, tile_index, salt):
+    h = hashlib.md5(f"{tile_index}:{salt}:{base_color}".encode("utf-8")).digest()
+    red, green, blue = (channel / 255.0 for channel in base_color)
+    hue, lightness, saturation = colorsys.rgb_to_hls(red, green, blue)
+
+    hue = (hue + ((h[0] / 255.0) - 0.5) * 0.08) % 1.0
+    saturation = min(1.0, max(0.05, saturation + ((h[1] / 255.0) - 0.5) * 0.18))
+    lightness = min(0.82, max(0.18, lightness + ((h[2] / 255.0) - 0.5) * 0.42))
+
+    r, g, b = colorsys.hls_to_rgb(hue, lightness, saturation)
+    return (int(r * 255), int(g * 255), int(b * 255))
+
+
+def assign_tile_fill_colors(tiles, adjacency, config, palette_colors):
+    unique_colors_cfg = config.get("unique_tile_colors", None)
+    assigned = [None] * len(tiles)
+    palette_colors = dedupe_colors(palette_colors)
+    tile_order = sorted(range(len(tiles)), key=lambda idx: (-len(adjacency[idx]), idx))
+
+    if unique_colors_cfg:
+        base_hue = unique_colors_cfg.get("base_hue", 80) / 360.0
+        hue_range = unique_colors_cfg.get("hue_range", 30) / 360.0
+        sat_range = (
+            unique_colors_cfg.get("saturation_min", 8) / 100.0,
+            unique_colors_cfg.get("saturation_max", 20) / 100.0,
+        )
+        lit_range = (
+            unique_colors_cfg.get("lightness_min", 40) / 100.0,
+            unique_colors_cfg.get("lightness_max", 62) / 100.0,
+        )
+    else:
+        base_hue = hue_range = None
+        sat_range = lit_range = None
+
+    for tile_index in tile_order:
+        used_neighbor_colors = {
+            assigned[neighbor_index]
+            for neighbor_index in adjacency[tile_index]
+            if assigned[neighbor_index] is not None
+        }
+
+        if unique_colors_cfg:
+            for salt in range(128):
+                color = generate_unique_tile_color(
+                    tile_index, base_hue, hue_range, sat_range, lit_range, salt=salt
+                )
+                if color not in used_neighbor_colors:
+                    assigned[tile_index] = color
+                    break
+            continue
+
+        default_color = tiles[tile_index][1][1]
+        candidate_colors = dedupe_colors([default_color] + palette_colors)
+
+        selected = None
+        for color in candidate_colors:
+            if color not in used_neighbor_colors:
+                selected = color
+                break
+
+        if selected is None:
+            for salt in range(128):
+                color = derive_color_variant(default_color, tile_index, salt)
+                if color not in used_neighbor_colors:
+                    selected = color
+                    break
+
+        assigned[tile_index] = selected or default_color
+
+    return assigned
+
+
+def select_accent_tiles(visible_indices, adjacency, seed, accent_count):
+    if accent_count <= 0 or not visible_indices:
+        return set()
+
+    ranked_visible = []
+    for tile_index in visible_indices:
+        h = hashlib.md5(f"{seed}:{tile_index}".encode("utf-8")).digest()
+        score = int.from_bytes(h[:4], "little")
+        ranked_visible.append((score, tile_index))
+
+    ranked_visible.sort()
+
+    selected = set()
+    for _, tile_index in ranked_visible:
+        if any(neighbor in selected for neighbor in adjacency[tile_index]):
+            continue
+        selected.add(tile_index)
+        if len(selected) >= accent_count:
+            break
+
+    return selected
 
 
 def seed_to_coordinate(seed):
@@ -460,23 +596,10 @@ def render_image(config):
     if svg_path:
         logo_polygons = load_logo_polygons(svg_path)
 
-    # Unique per-tile color settings (HSL-based)
-    unique_colors_cfg = config.get("unique_tile_colors", None)
-    base_hue = None
-    if unique_colors_cfg:
-        # base_hue in config is 0-360 degrees, convert to 0-1
-        base_hue = unique_colors_cfg.get("base_hue", 80) / 360.0
-        hue_range = unique_colors_cfg.get("hue_range", 30) / 360.0
-        sat_range = (
-            unique_colors_cfg.get("saturation_min", 8) / 100.0,
-            unique_colors_cfg.get("saturation_max", 20) / 100.0,
-        )
-        lit_range = (
-            unique_colors_cfg.get("lightness_min", 40) / 100.0,
-            unique_colors_cfg.get("lightness_max", 62) / 100.0,
-        )
-
     pattern_generator.colors = build_tile_colors(config)
+    palette_colors = dedupe_colors(
+        [fill_data[1] for fill_data in pattern_generator.colors.values()]
+    )
 
     reset_generator()
     offset_coordinate = seed_to_coordinate(seed)
@@ -486,15 +609,22 @@ def render_image(config):
         output_image = create_background_image(width, height, background_color)
         coverage_mask = create_coverage_mask(width, height)
 
+        adjacency = build_tile_adjacency(pattern_generator.vertices_to_draw)
+        fill_colors = assign_tile_fill_colors(
+            pattern_generator.vertices_to_draw,
+            adjacency,
+            config,
+            palette_colors,
+        )
+
         # Accent color setup
         accent_color_cfg = config.get("accent_color", None)
         accent_count = int(config.get("accent_count", 0))
         accent_color = hex_to_bgr(accent_color_cfg) if accent_color_cfg else None
 
         # Find visible tiles first, then pick accents from those
-        accent_indices = set()
+        visible = []
         if accent_color and accent_count > 0:
-            visible = []
             for ti, tile in enumerate(pattern_generator.vertices_to_draw):
                 # Check if tile centroid is within viewport
                 cx = sum(v.x for v in tile[0]) / len(tile[0])
@@ -503,11 +633,7 @@ def render_image(config):
                 sy = cy * scalar + height + offset_coordinate.y * height
                 if 0 <= sx < width and 0 <= sy < height:
                     visible.append(ti)
-            if visible:
-                for k in range(accent_count):
-                    h = hashlib.md5((seed * 1000 + k).to_bytes(8, 'little')).digest()
-                    idx = (h[0] | h[1] << 8) % len(visible)
-                    accent_indices.add(visible[idx])
+        accent_indices = select_accent_tiles(visible, adjacency, seed, accent_count)
 
         outline_color = config.get("outline_color", None)
         outline_rgb = hex_to_bgr(outline_color) if outline_color else None
@@ -515,14 +641,12 @@ def render_image(config):
 
         for tile_index, tile in enumerate(pattern_generator.vertices_to_draw):
             channel_override = None
+            tile_fill_color = fill_colors[tile_index]
             if tile_index in accent_indices:
-                tile = [tile[0], [tile[1][0], accent_color]]
+                tile_fill_color = accent_color
                 # Darker variant of accent color for the logo channels
                 channel_override = tuple(max(0, c // 2) for c in accent_color)
-            elif base_hue is not None:
-                tile_color = generate_unique_tile_color(
-                    tile_index, base_hue, hue_range, sat_range, lit_range)
-                tile = [tile[0], [tile[1][0], tile_color]]
+            tile = [tile[0], [tile[1][0], tile_fill_color]]
 
             draw_tile(
                 tile,
