@@ -26,6 +26,43 @@ HAT_MAX_Y = max(v.y for v in hat_outline)
 HAT_WIDTH = HAT_MAX_X - HAT_MIN_X
 HAT_HEIGHT = HAT_MAX_Y - HAT_MIN_Y
 
+# Coordinates inferred from the TokenTek SVG and mapped into hat space.
+LOGO_NODE_COORDS = {
+    "left_top": (0.013810, -1.732051),
+    "left_mid": (0.013810, -0.000586),
+    "bottom": (0.976144, 1.791805),
+    "upper_center": (1.509343, -0.892794),
+    "center": (1.509343, 0.888147),
+    "mid_right": (2.021893, -0.000586),
+    "lower_right": (2.992609, 1.749893),
+    "right_top": (3.068664, -1.629214),
+    "right_mid": (3.068664, -0.000586),
+}
+
+LOGO_EDGES = (
+    ("left_top", "left_mid"),
+    ("left_mid", "upper_center"),
+    ("left_mid", "center"),
+    ("bottom", "center"),
+    ("upper_center", "mid_right"),
+    ("center", "mid_right"),
+    ("center", "lower_right"),
+    ("mid_right", "right_mid"),
+    ("right_top", "right_mid"),
+)
+
+LOGO_NODE_RADIUS_MULTIPLIERS = {
+    "left_top": 0.9,
+    "left_mid": 1.0,
+    "bottom": 0.95,
+    "upper_center": 1.0,
+    "center": 1.2,
+    "mid_right": 1.0,
+    "lower_right": 0.95,
+    "right_top": 0.9,
+    "right_mid": 1.0,
+}
+
 
 # --- SVG path parsing ---
 
@@ -472,6 +509,38 @@ def draw_line(image, mask, width, height, start, end, color, stroke_width):
             y1 += step_y
 
 
+def draw_filled_circle(image, mask, width, height, center, radius, color):
+    cx = int(round(center[0]))
+    cy = int(round(center[1]))
+    radius = max(1, int(round(radius)))
+    radius_sq = radius * radius
+
+    for y in range(cy - radius, cy + radius + 1):
+        dy = y - cy
+        for x in range(cx - radius, cx + radius + 1):
+            dx = x - cx
+            if dx * dx + dy * dy <= radius_sq:
+                set_pixel(image, mask, width, height, x, y, color)
+
+
+def draw_round_line(image, mask, width, height, start, end, color, line_width):
+    radius = max(1.0, line_width / 2.0)
+    dx = end[0] - start[0]
+    dy = end[1] - start[1]
+    length = math.hypot(dx, dy)
+
+    if length == 0:
+        draw_filled_circle(image, mask, width, height, start, radius, color)
+        return
+
+    steps = max(1, int(math.ceil(length / max(0.75, radius * 0.18))))
+    for step in range(steps + 1):
+        t = step / steps
+        x = start[0] + dx * t
+        y = start[1] + dy * t
+        draw_filled_circle(image, mask, width, height, (x, y), radius, color)
+
+
 def fill_polygon(image, mask, width, height, points, color):
     if not points:
         return
@@ -509,7 +578,49 @@ def fill_polygon(image, mask, width, height, points, color):
                 set_pixel(image, mask, width, height, x, y, color)
 
 
-def draw_tile(tile, image, mask, width, height, offset_coord, scalar, stroke_color, stroke_width, logo_polygons=None, channel_color_override=None):
+def transform_logo_nodes(tile_vertices, width, height, offset_coord, scalar):
+    mat = recover_affine(tile_vertices)
+    screen_nodes = {}
+
+    for name, (hx, hy) in LOGO_NODE_COORDS.items():
+        tx = mat[0] * hx + mat[1] * hy + mat[2]
+        ty = mat[3] * hx + mat[4] * hy + mat[5]
+        sx = tx * scalar - offset_coord.x * width
+        sy = ty * scalar + height + offset_coord.y * height
+        screen_nodes[name] = (sx, sy)
+
+    return screen_nodes
+
+
+def draw_logo_network(image, mask, width, height, screen_nodes, color, scalar):
+    line_width = max(2, int(round(scalar * 0.07)))
+    base_radius = max(line_width * 1.45, scalar * 0.11)
+
+    for start_name, end_name in LOGO_EDGES:
+        draw_round_line(
+            image,
+            mask,
+            width,
+            height,
+            screen_nodes[start_name],
+            screen_nodes[end_name],
+            color,
+            line_width,
+        )
+
+    for name, center in screen_nodes.items():
+        draw_filled_circle(
+            image,
+            mask,
+            width,
+            height,
+            center,
+            base_radius * LOGO_NODE_RADIUS_MULTIPLIERS[name],
+            color,
+        )
+
+
+def draw_tile(tile, image, mask, width, height, offset_coord, scalar, stroke_color, stroke_width, draw_logo=False, channel_color_override=None):
     fill_color = tile[1][1]
     points = []
 
@@ -518,26 +629,12 @@ def draw_tile(tile, image, mask, width, height, offset_coord, scalar, stroke_col
         y = vertex.y * scalar + height + offset_coord.y * height
         points.append((x, y))
 
-    if logo_polygons:
-        # Fill entire tile with channel color, then overlay logo pieces
-        ch_color = channel_color_override if channel_color_override else stroke_color
-        fill_polygon(image, mask, width, height, points, ch_color)
+    fill_polygon(image, mask, width, height, points, fill_color)
 
-        # Recover affine transform from hat_outline to this tile's vertices
-        mat = recover_affine(tile[0])
-
-        for logo_poly in logo_polygons:
-            screen_pts = []
-            for hx, hy in logo_poly:
-                tx = mat[0] * hx + mat[1] * hy + mat[2]
-                ty = mat[3] * hx + mat[4] * hy + mat[5]
-                sx = tx * scalar - offset_coord.x * width
-                sy = ty * scalar + height + offset_coord.y * height
-                screen_pts.append((sx, sy))
-            if len(screen_pts) >= 3:
-                fill_polygon(image, mask, width, height, screen_pts, fill_color)
-    else:
-        fill_polygon(image, mask, width, height, points, fill_color)
+    if draw_logo:
+        logo_color = channel_color_override if channel_color_override else stroke_color
+        screen_nodes = transform_logo_nodes(tile[0], width, height, offset_coord, scalar)
+        draw_logo_network(image, mask, width, height, screen_nodes, logo_color, scalar)
 
     for index in range(len(points)):
         draw_line(
@@ -590,11 +687,7 @@ def render_image(config):
     stroke_width = int(config.get("stroke_width", 2))
     empty_pixel_tolerance = int(config.get("empty_pixel_tolerance", 3))
 
-    # Load logo SVG
-    svg_path = config.get("logo_svg", None)
-    logo_polygons = None
-    if svg_path:
-        logo_polygons = load_logo_polygons(svg_path)
+    draw_logo = bool(config.get("logo_svg", None))
 
     pattern_generator.colors = build_tile_colors(config)
     palette_colors = dedupe_colors(
@@ -658,7 +751,7 @@ def render_image(config):
                 scalar,
                 stroke_color,
                 stroke_width,
-                logo_polygons,
+                draw_logo,
                 channel_override,
             )
 
